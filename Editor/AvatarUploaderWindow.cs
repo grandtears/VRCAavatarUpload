@@ -1,7 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
+using System.Threading.Tasks;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 using VRC.Core;
 using VRC.SDK3.Avatars.Components;
 using VRC.SDK3A.Editor;
@@ -71,7 +74,7 @@ namespace LastMemories.AvatarUploader
 
         private void OnGUI()
         {
-            EditorGUILayout.HelpBox("アバタールートを下の枠へドロップしてください。登録順に現在のビルド対象へアップロードします。\n無効なアバタールートは処理前に有効化し、全処理終了・停止時に元のチェック状態へ戻します。\nBlueprint ID設定済みのアバターが対象です。名前・公開設定・サムネイルは既存の内容を維持します。", MessageType.Info);
+            EditorGUILayout.HelpBox("アバタールートを下の枠へドロップしてください。一覧の上から現在のビルド対象へアップロードします。\n処理する1体だけをオンにし、ほかのシーン内アバタールートを一時的にオフにします。終了・停止時に元のチェック状態へ戻します。\nBlueprint ID設定済みのアバターが対象です。名前・公開設定・サムネイルは既存の内容を維持します。", MessageType.Info);
             // 処理中の追加・削除を禁止し、実行対象と表示リストの対応を保つ。
             using (new EditorGUI.DisabledScope(running))
             {
@@ -113,6 +116,7 @@ namespace LastMemories.AvatarUploader
             }
             EditorGUILayout.EndScrollView();
             if (running) EditorGUILayout.LabelField(progress ?? "処理中…", EditorStyles.wordWrappedLabel);
+            EditorGUILayout.LabelField("開始・再試行ボタンを押すことで、対象すべてをアップロードする権利があり、第三者の権利を侵害しないことに同意します。", EditorStyles.wordWrappedMiniLabel);
             using (new EditorGUILayout.HorizontalScope())
             {
                 // コンパイル中・Play移行中・Play中は、Editorのビルド処理を開始させない。
@@ -181,12 +185,11 @@ namespace LastMemories.AvatarUploader
             var queue = entries.FindAll(e => !failedOnly || e.status == Status.Failed);
             if (queue.Count == 0) return;
 
-            // Inspectorのチェック状態（activeSelf）を、変更前に全対象分保存する。
-            // activeInHierarchyは親の状態も含むため、復元する値には使用しない。
+            // 未登録・非アクティブを含む、ロード済みシーンの全アバタールートを保存する。
+            // Prefabアセットやプレビューシーンには触れない。
             var originalActiveStates = new Dictionary<GameObject, bool>();
-            foreach (var entry in queue)
-                if (entry.root != null && !originalActiveStates.ContainsKey(entry.root))
-                    originalActiveStates.Add(entry.root, entry.root.activeSelf);
+            foreach (var root in GetSceneAvatarRoots())
+                originalActiveStates[root] = root.activeSelf;
 
             running = true;
             stopRequested = false;
@@ -217,19 +220,32 @@ namespace LastMemories.AvatarUploader
                         // 登録後に削除されたりDescriptorを外されたりする可能性があるため再検証する。
                         if (entry.root == null || !entry.root.TryGetComponent<VRCAvatarDescriptor>(out _))
                             throw new InvalidOperationException("アバタールートが見つかりません。");
+                        if (!originalActiveStates.ContainsKey(entry.root))
+                            throw new InvalidOperationException("開始時のロード済みシーン内にないアバターは処理できません。");
+                        foreach (var state in originalActiveStates)
+                            if (state.Key != null && state.Key != entry.root &&
+                                (entry.root.transform.IsChildOf(state.Key.transform) || state.Key.transform.IsChildOf(entry.root.transform)))
+                                throw new InvalidOperationException("アバタールートが親子に入れ子になっています。独立したルートに配置してください。");
                         // 親の有効化は他のオブジェクトにも影響するため、ルートだけを操作する。
                         if (entry.root.transform.parent != null && !entry.root.transform.parent.gameObject.activeInHierarchy)
                             throw new InvalidOperationException("親オブジェクトが無効です。親を有効にしてから再試行してください。");
                         // 新規登録には名前やサムネイルなどの準備が必要なため、既存IDの更新に限定する。
                         if (!entry.root.TryGetComponent<PipelineManager>(out var pipeline) || string.IsNullOrWhiteSpace(pipeline.blueprintId))
                             throw new InvalidOperationException("Blueprint IDが未設定です。SDKで初回アップロードを行ってください。");
+                        ActivateOnly(entry.root, originalActiveStates);
                         // サーバーから最新データを取得し、既存の名前・公開設定などを引き継ぐ。
                         var avatar = await VRCApi.GetAvatar(pipeline.blueprintId, true);
                         // 通信待ちの間にウィンドウが閉じられていたら、ビルドを新たに開始しない。
                         if (closing) throw new InvalidOperationException("ウィンドウが閉じられたため中断しました。");
 
-                        // 順番が来たアバターをビルド直前に有効化する。復元は全処理終了時に行う。
-                        entry.root.SetActive(true);
+                        // SDK自身の同意処理でサーバー登録とセッション記録を行う。
+                        // ユーザーの一括同意を反映し、SDK内の個別モーダル待ちを防ぐ。
+                        await AgreeToCopyright(avatar.ID);
+                        if (closing) throw new InvalidOperationException("ウィンドウが閉じられたため中断しました。");
+
+                        // 通信中のシーン変更も含めて再走査し、排他状態を検証してからSDKへ渡す。
+                        ActivateOnly(entry.root, originalActiveStates);
+                        Debug.Log("[Avatar Uploader] 単独オン確認済み、ビルド開始: " + entry.root.name, entry.root);
                         // awaitで完了を待ってから次へ進むため、複数アバターの処理は並列にならない。
                         await builder.BuildAndUpload(entry.root, avatar);
                         // SDKが例外を投げずに終了した場合も、通知がなければ成功表示を避ける。
@@ -263,7 +279,7 @@ namespace LastMemories.AvatarUploader
                     if (state.Key == null) continue;
                     try
                     {
-                        // 開始時と異なる場合だけ戻す。対象ルート以外や子のチェック状態は操作しない。
+                        // 未登録のアバターも含め、開始時と異なる場合だけ戻す。
                         if (state.Key.activeSelf != state.Value) state.Key.SetActive(state.Value);
                     }
                     catch (Exception ex)
@@ -277,6 +293,69 @@ namespace LastMemories.AvatarUploader
                 EditorApplication.UnlockReloadAssemblies();
                 if (!closing) Repaint();
             }
+        }
+
+        private static List<GameObject> GetSceneAvatarRoots()
+        {
+            var roots = new List<GameObject>();
+            for (var i = 0; i < SceneManager.sceneCount; i++)
+            {
+                var scene = SceneManager.GetSceneAt(i);
+                if (!scene.isLoaded || UnityEditor.SceneManagement.EditorSceneManager.IsPreviewScene(scene)) continue;
+                foreach (var sceneRoot in scene.GetRootGameObjects())
+                    foreach (var descriptor in sceneRoot.GetComponentsInChildren<VRCAvatarDescriptor>(true))
+                        if (!roots.Contains(descriptor.gameObject)) roots.Add(descriptor.gameObject);
+            }
+            return roots;
+        }
+
+        private static void ActivateOnly(GameObject target, Dictionary<GameObject, bool> originalActiveStates)
+        {
+            if (target == null) throw new InvalidOperationException("アバタールートが見つかりません。");
+            var roots = GetSceneAvatarRoots();
+            if (!roots.Contains(target))
+                throw new InvalidOperationException("対象アバターがロード済みシーン内にありません。");
+            foreach (var root in roots)
+            {
+                // 実行中に追加されたルートも、変更前の状態を保存する。
+                if (!originalActiveStates.ContainsKey(root)) originalActiveStates.Add(root, root.activeSelf);
+                if (root != target &&
+                    (target.transform.IsChildOf(root.transform) || root.transform.IsChildOf(target.transform)))
+                    throw new InvalidOperationException("アバタールートが親子に入れ子になっています。独立したルートに配置してください。");
+            }
+            foreach (var root in roots)
+                if (root != target && root.activeSelf) root.SetActive(false);
+            target.SetActive(true);
+
+            // OnEnableなどの副作用も確認し、複数オンのままビルドへ進ませない。
+            if (!target.activeInHierarchy)
+                throw new InvalidOperationException("対象アバターを有効にできませんでした。親の状態を確認してください。");
+            foreach (var root in GetSceneAvatarRoots())
+                if (root != target && root.activeSelf)
+                    throw new InvalidOperationException("別のアバタールートがオンのためビルドを中止しました: " + root.name);
+        }
+
+        private static async Task AgreeToCopyright(string contentId)
+        {
+            if (string.IsNullOrWhiteSpace(contentId))
+                throw new InvalidOperationException("同意対象のアバターIDを取得できませんでした。");
+
+            // SDKには一括同意用の公開APIがないため、既存の同意実装に限定して接続する。
+            // API変更時はダイアログ待ちや同意の偽装に進まず、項目を失敗として報告する。
+            Type agreementType = null;
+            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                agreementType = assembly.GetType("VRC.SDKBase.VRCCopyrightAgreement");
+                if (agreementType != null) break;
+            }
+            var agree = agreementType?.GetMethod("Agree", BindingFlags.Static | BindingFlags.NonPublic,
+                null, new[] { typeof(string) }, null);
+            if (agree == null || agree.ReturnType != typeof(Task<bool>))
+                throw new NotSupportedException("このSDKの権利確認の自動処理には対応していません。SDKのバージョンを確認してください。");
+
+            var task = (Task<bool>)agree.Invoke(null, new object[] { contentId });
+            if (!await task)
+                throw new InvalidOperationException("SDKへの権利確認の登録に失敗しました。アップロードは開始していません。");
         }
     }
 }
